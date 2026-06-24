@@ -6,6 +6,10 @@
 from agents import Agent, RunContextWrapper, function_tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from restaurant_agent_models import CustomerContext
+from restaurant_agents.guardrails import (
+  restaurant_input_guardrail,
+  restaurant_output_guardrail,
+)
 
 
 # --- mock 데이터 ----------------------------------------------------------
@@ -125,9 +129,11 @@ def menu_agent_instructions(
     - 알레르기를 물으면 get_dish_detail 로 해당 요리의 allergens 를 확인해 명확히 알려주세요.
     - 가격은 원 단위로 안내하고, 매운맛 정도(0~3)도 참고로 함께 안내하세요.
 
-    handoff 규칙:
-    - 고객이 '주문'을 하려고 하면 주문 담당 에이전트로 연결하세요.
-    - 고객이 '예약'을 하려고 하면 예약 담당 에이전트로 연결하세요.
+    handoff 규칙 (반드시 지키세요):
+    - 당신의 담당(메뉴/재료/알레르기/채식)이 아닌 요청은 직접 처리하지 말고 즉시 해당 담당자에게 handoff 하세요.
+      · 음식 주문/주문상태 → 주문 담당   · 테이블 예약 → 예약 담당   · 불만·환불·보상 → 불만 처리 담당
+    - [중요] 대화 기록에 주문·예약 정보가 남아 있더라도 당신이 직접 처리하지 말고 반드시 해당 담당자에게 handoff 하세요.
+    - handoff 는 반드시 제공된 handoff 도구로만 수행하고, JSON 이나 텍스트로 흉내 내지 마세요.
     - 무엇을 원하는지 불분명하면 안내 데스크(Triage)로 연결하세요.
   """
 
@@ -137,4 +143,6 @@ menu_agent = Agent(
   handoff_description="메뉴 구성, 재료, 알레르기, 채식 옵션 문의를 처리합니다.",
   instructions=menu_agent_instructions,
   tools=[get_menu, get_dish_detail],
+  input_guardrails=[restaurant_input_guardrail],
+  output_guardrails=[restaurant_output_guardrail],
 )

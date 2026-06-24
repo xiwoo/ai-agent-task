@@ -8,7 +8,15 @@ class CustomerContext(BaseModel):
   membership: str = "일반"  # 일반 / VIP
 
 
-class RestaurantTopicGuardrailOutput(BaseModel):
-  """Triage 입력 가드레일 판정 결과."""
+class RestaurantInputGuardrailOutput(BaseModel):
+  """입력 가드레일 판정 결과 (off-topic 또는 부적절한 언어면 거부)."""
   is_off_topic: bool
+  is_inappropriate: bool
+  reason: str
+
+
+class RestaurantOutputGuardrailOutput(BaseModel):
+  """출력 가드레일 판정 결과 (비전문적/무례하거나 내부 정보 노출이면 차단)."""
+  is_unprofessional: bool
+  reveals_internal_info: bool
   reason: str

@@ -6,6 +6,10 @@
 from agents import Agent, RunContextWrapper, function_tool
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from restaurant_agent_models import CustomerContext
+from restaurant_agents.guardrails import (
+  restaurant_input_guardrail,
+  restaurant_output_guardrail,
+)
 
 
 @function_tool
@@ -54,9 +58,11 @@ def reservation_agent_instructions(
     - 정보가 모이면 check_table_availability 도구로 가용성을 확인하고, 가능한 시간대를 안내하세요.
     - 고객이 시간을 확정하면 create_reservation 도구로 예약을 확정하고, 예약 번호를 안내하세요.
 
-    handoff 규칙:
-    - 메뉴(재료/알레르기/채식)나 추천이 궁금하면 메뉴 전문가에게 연결하세요.
-    - 음식 '주문' 요청이면 주문 담당 에이전트로 연결하세요.
+    handoff 규칙 (반드시 지키세요):
+    - 당신의 담당(테이블 예약/예약 확인)이 아닌 요청은 직접 처리하지 말고 즉시 해당 담당자에게 handoff 하세요.
+      · 메뉴/재료/알레르기/채식·추천 → 메뉴 전문가   · 음식 주문/주문상태 → 주문 담당   · 불만·환불·보상 → 불만 처리 담당
+    - [중요] 대화 기록에 메뉴·주문 정보가 남아 있더라도 당신이 직접 처리하지 말고 반드시 해당 담당자에게 handoff 하세요.
+    - handoff 는 반드시 제공된 handoff 도구로만 수행하고, JSON 이나 텍스트로 흉내 내지 마세요.
     - 무엇을 원하는지 불분명하면 안내 데스크(Triage)로 연결하세요.
   """
 
@@ -66,4 +72,6 @@ reservation_agent = Agent(
   handoff_description="테이블 예약과 예약 확인을 처리합니다.",
   instructions=reservation_agent_instructions,
   tools=[check_table_availability, create_reservation],
+  input_guardrails=[restaurant_input_guardrail],
+  output_guardrails=[restaurant_output_guardrail],
 )
