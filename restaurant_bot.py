@@ -12,12 +12,7 @@ from agents import (
 from restaurant_agent_models import CustomerContext
 from restaurant_agents.triage_agent import triage_agent
 
-# 응대 대상 고객 (개인화용 컨텍스트)
-customer_ctx = CustomerContext(
-  customer_id=1,
-  name="민수",
-  membership="VIP",
-)
+# customer_ctx 는 이름 입력 팝업에서 이름을 받은 뒤 아래에서 생성한다.
 
 # 대화 이력을 기억하는 인메모리 저장소 (단순 list)
 if "messages" not in st.session_state:
@@ -184,6 +179,30 @@ def paint_history():
       text_placeholder.write(message["content"][0]["text"].replace("$", r"\$"))
 
 
+# 이름 입력 팝업: 아직 이름을 받지 않았다면(=새 세션/리셋 직후) 먼저 이름을 입력받는다.
+@st.dialog("티앤미미 중식당에 오신 것을 환영합니다 🥢")
+def ask_customer_name():
+  st.write("응대를 시작하기 전에 성함을 알려주세요.")
+  name = st.text_input("이름", placeholder="예: 홍길동")
+  if st.button("시작하기", type="primary", use_container_width=True):
+    if name.strip():
+      st.session_state["customer_name"] = name.strip()
+      st.rerun()
+    else:
+      st.warning("이름을 입력해 주세요.")
+
+
+if "customer_name" not in st.session_state:
+  ask_customer_name()
+  st.stop()
+
+# 응대 대상 고객 (입력받은 이름으로 개인화)
+customer_ctx = CustomerContext(
+  customer_id=1,
+  name=st.session_state["customer_name"],
+  membership="VIP",
+)
+
 # 이전 대화 이력 출력
 paint_history()
 
@@ -201,5 +220,6 @@ with st.sidebar:
   if reset:
     st.session_state["messages"] = []
     st.session_state["agent"] = triage_agent
+    st.session_state.pop("customer_name", None)
     st.rerun()
   st.write(st.session_state["messages"])
