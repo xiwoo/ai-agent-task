@@ -1,12 +1,12 @@
 import asyncio
 import base64
 import json
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from google.adk.agents import BaseAgent, LlmAgent, SequentialAgent
+from google.adk.agents import BaseAgent, LlmAgent, ParallelAgent, SequentialAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.adk.models.lite_llm import LiteLlm
@@ -27,6 +27,9 @@ IMAGE_MODEL = "gpt-image-1"
 
 # 두 에이전트가 공유하는 State 키
 STORY_BOOK_STATE_KEY = "story_book"
+
+# 동화책 페이지 수(= 동시에 생성할 삽화 수)
+PAGE_COUNT = 5
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,23 +63,7 @@ class StoryBook(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Story Writer: 테마 → 구조화된 5페이지 동화. 결과를 State["story_book"] 에 저장.
-# ──────────────────────────────────────────────────────────────────────────────
-story_writer_agent = LlmAgent(
-  name="StoryWriterAgent",
-  model=MODEL,
-  description=STORY_WRITER_DESCRIPTION,
-  instruction=STORY_WRITER_INSTRUCTION,
-  output_schema=StoryBook,
-  output_key=STORY_BOOK_STATE_KEY,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Illustrator: State["story_book"] 를 읽어 페이지마다 이미지를 결정론적으로 생성.
-#    - LLM 에 도구 호출을 맡기지 않고 5페이지를 직접 순회한다(이미지 누락 방지).
-#    - 페이지마다 "본문 + 시각묘사 + 이미지(인라인)" 를 하나의 이벤트로 출력하고,
-#      동일 이미지를 Artifact 로도 저장한다.
+# 공용 헬퍼
 # ──────────────────────────────────────────────────────────────────────────────
 def _generate_image_bytes(image_prompt: str) -> bytes:
   """OpenAI Images API 로 이미지를 생성해 PNG 바이트를 반환한다 (동기 호출)."""
@@ -90,91 +77,188 @@ def _generate_image_bytes(image_prompt: str) -> bytes:
   return base64.b64decode(result.data[0].b64_json)
 
 
-class IllustratorAgent(BaseAgent):
-  """State 의 story_book 을 읽어 페이지별 삽화를 생성/저장하는 커스텀 에이전트."""
+def _load_book(ctx: InvocationContext) -> dict:
+  """State 에 저장된 story_book 을 dict 로 로드한다 (str/dict 모두 처리)."""
+  raw = ctx.session.state.get(STORY_BOOK_STATE_KEY)
+  if not raw:
+    return {}
+  return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def _find_page(book: dict, page_no: int) -> Optional[dict]:
+  """book 에서 page_number 가 일치하는 페이지를 찾는다(없으면 순번으로 대체)."""
+  pages = book.get("pages", [])
+  for page in pages:
+    if page.get("page_number") == page_no:
+      return page
+  if 1 <= page_no <= len(pages):
+    return pages[page_no - 1]
+  return None
+
+
+def _text_event(author: str, text: str) -> Event:
+  """텍스트만 담은 model 이벤트를 만든다."""
+  return Event(
+    author=author,
+    content=types.Content(role="model", parts=[types.Part(text=text)]),
+  )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) Story Writer: 테마 → 구조화된 5페이지 동화. 결과를 State["story_book"] 에 저장.
+#    - 구조화 출력을 위해 LlmAgent(story_writer_llm)를 쓰되, LlmAgent 는 스스로 진행
+#      메시지를 이벤트로 낼 수 없으므로, 얇은 커스텀 단계(StoryWriterAgent)로 감싸
+#      "작성 중..." 을 먼저 채팅으로 표시한 뒤 내부 LlmAgent 에 위임한다.
+# ──────────────────────────────────────────────────────────────────────────────
+story_writer_llm = LlmAgent(
+  name="StoryWriterLlm",
+  model=MODEL,
+  description=STORY_WRITER_DESCRIPTION,
+  instruction=STORY_WRITER_INSTRUCTION,
+  output_schema=StoryBook,
+  output_key=STORY_BOOK_STATE_KEY,
+)
+
+
+class StoryWriterAgent(BaseAgent):
+  """'스토리 작성 중...' 을 표시하고 내부 LlmAgent 로 동화를 작성하는 처리 단계."""
 
   async def _run_async_impl(
     self, ctx: InvocationContext
   ) -> AsyncGenerator[Event, None]:
-    raw = ctx.session.state.get(STORY_BOOK_STATE_KEY)
-    if not raw:
-      yield self._text_event(
-        ctx, "⚠️ story_book 데이터가 State 에 없습니다. 먼저 동화를 작성해야 합니다."
-      )
-      return
+    yield _text_event(self.name, "📝 스토리 작성 중...")
 
-    # output_schema 결과는 보통 dict 로 저장되지만, 문자열(JSON)일 수도 있어 모두 처리.
-    book = json.loads(raw) if isinstance(raw, str) else raw
-    print(book.get("character_sheet", ""))
-    pages = book.get("pages", [])
-
-    # 동화책 표지 안내(제목/테마)
-    yield self._text_event(
-      ctx,
-      f"📚 **{book.get('title', '동화책')}** \n— 테마: {book.get('theme', '')}\n"
-      f"총 {len(pages)}페이지를 생성합니다...",
-    )
-
-    for page in pages:
-      page_no = page.get("page_number")
-      text = page.get("text", "")
-      visual = page.get("visual_description", "")
-      image_prompt = page.get("image_prompt") or visual
-
-      header = f"### Page {page_no}\n {text}"
-
-      try:
-        # 동기 OpenAI 호출을 이벤트 루프 밖(스레드)에서 실행.
-        image_bytes = await asyncio.to_thread(_generate_image_bytes, image_prompt)
-      except Exception as e:  # noqa: BLE001
-        yield self._text_event(
-          ctx, f"{header}\n\n❌ 이미지 생성 실패: {e}"
-        )
-        continue
-
-      # Artifact 로 저장 (요구사항: 이미지가 Artifact 로 저장됨)
-      filename = f"page_{page_no}.png"
-      image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-      version = await ctx.artifact_service.save_artifact(
-        app_name=ctx.session.app_name,
-        user_id=ctx.session.user_id,
-        session_id=ctx.session.id,
-        filename=filename,
-        artifact=image_part,
-      )
-
-      # adk web 은 한 이벤트에 텍스트+이미지가 같이 있으면 이미지만 렌더링하므로,
-      # 페이지 텍스트를 먼저 텍스트 이벤트로 출력한 뒤 이미지 이벤트를 출력한다.
-      yield self._text_event(
-        ctx, header
-      )
-      yield Event(
-        author=self.name,
-        content=types.Content(role="model", parts=[image_part]),
-        actions=EventActions(artifact_delta={filename: version}),
-      )
-
-    yield self._text_event(ctx, "✅ 동화책 삽화 생성을 모두 완료했습니다!")
-
-  def _text_event(self, ctx: InvocationContext, text: str) -> Event:
-    return Event(
-      author=self.name,
-      content=types.Content(role="model", parts=[types.Part(text=text)]),
-    )
+    async for event in self.sub_agents[0].run_async(ctx):
+      # 내부 LlmAgent 가 뱉는 구조화 출력(StoryBook JSON)은 adk web 채팅에 노출하지 않는다.
+      # 다만 output_key(story_book) State 저장은 event.actions.state_delta 로 이뤄지므로,
+      # content 만 비우고 actions 는 그대로 둔 채 yield 해야 저장이 정상 동작한다.
+      event.content = None
+      yield event
 
 
-illustrator_agent = IllustratorAgent(
-  name="IllustratorAgent",
-  description=ILLUSTRATOR_DESCRIPTION,
+story_writer_agent = StoryWriterAgent(
+  name="StoryWriterAgent", sub_agents=[story_writer_llm]
 )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3) 루트: 작가 → 일러스트레이터 순서로 실행하는 시퀀스 에이전트.
+# 2) Illustrator (Parallel): 페이지마다 하나의 자식 에이전트가 삽화를 '동시에' 생성.
+#    - 각 PageImageAgent 는 자기 페이지의 image_prompt 로 이미지를 만들어
+#      Artifact(page_N.png) 로 저장한다. (본문/이미지 출력은 Presenter 가 담당)
+#    - ParallelAgent 로 감싸 5개를 동시에 실행한다(이미지 생성 시간 단축).
+# ──────────────────────────────────────────────────────────────────────────────
+class PageImageAgent(BaseAgent):
+  """자신에게 할당된 한 페이지의 삽화만 생성/저장하는 커스텀 에이전트."""
+  page_number: int
+
+  async def _run_async_impl(
+    self, ctx: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    book = _load_book(ctx)
+    page = _find_page(book, self.page_number)
+    if not page:
+      return
+
+    # 진행 상황을 채팅으로 표시 (병렬 실행이라 5개가 거의 동시에 뜬다).
+    yield _text_event(
+      self.name, f"🖼️ 이미지 {self.page_number}/{PAGE_COUNT} 생성 중..."
+    )
+
+    image_prompt = page.get("image_prompt") or page.get("visual_description", "")
+    filename = f"page_{self.page_number}.png"
+
+    try:
+      # 동기 OpenAI 호출을 이벤트 루프 밖(스레드)에서 실행 → 5개가 진짜로 동시에 돈다.
+      image_bytes = await asyncio.to_thread(_generate_image_bytes, image_prompt)
+    except Exception as e:  # noqa: BLE001
+      yield _text_event(self.name, f"❌ 페이지 {self.page_number} 이미지 생성 실패: {e}")
+      return
+
+    # Artifact 로 저장 (요구사항: 이미지가 Artifact 로 저장됨)
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+    version = await ctx.artifact_service.save_artifact(
+      app_name=ctx.session.app_name,
+      user_id=ctx.session.user_id,
+      session_id=ctx.session.id,
+      filename=filename,
+      artifact=image_part,
+    )
+
+    # 아티팩트 등록용 이벤트(콘텐츠 없음). 본문+삽화 출력은 Presenter 가 순서대로 담당.
+    yield Event(
+      author=self.name,
+      actions=EventActions(artifact_delta={filename: version}),
+    )
+
+
+page_image_agents = [
+  PageImageAgent(name=f"PageImageAgent_{n}", page_number=n)
+  for n in range(1, PAGE_COUNT + 1)
+]
+
+illustrator_parallel_agent = ParallelAgent(
+  name="IllustratorParallelAgent",
+  description=ILLUSTRATOR_DESCRIPTION,
+  sub_agents=page_image_agents,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) Presenter: 완성된 동화책을 제목 → 페이지 순서대로 (텍스트 + 삽화) 로 출력.
+#    - 병렬 단계에서 저장한 Artifact 를 다시 읽어 페이지 순서대로 렌더링한다.
+#      (ParallelAgent 는 이벤트가 뒤섞이므로, 최종 출력은 여기서 정렬해 보여준다.)
+# ──────────────────────────────────────────────────────────────────────────────
+class StoryBookPresenterAgent(BaseAgent):
+  """State 의 동화 + 저장된 삽화를 페이지 순서대로 출력하는 커스텀 에이전트."""
+
+  async def _run_async_impl(
+    self, ctx: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    yield _text_event(self.name, "📖 동화책을 완성하는 중...")
+    book = _load_book(ctx)
+    if not book:
+      yield _text_event(
+        self.name, "⚠️ story_book 데이터가 State 에 없습니다. 먼저 동화를 작성해야 합니다."
+      )
+      return
+
+    pages = book.get("pages", [])
+    yield _text_event(
+      self.name,
+      f"📚 **{book.get('title', '동화책')}**\n— 테마: {book.get('theme', '')}",
+    )
+
+    for page in sorted(pages, key=lambda p: p.get("page_number", 0)):
+      page_no = page.get("page_number")
+      yield _text_event(self.name, f"### Page {page_no}\n{page.get('text', '')}")
+
+      filename = f"page_{page_no}.png"
+      image_part = await ctx.artifact_service.load_artifact(
+        app_name=ctx.session.app_name,
+        user_id=ctx.session.user_id,
+        session_id=ctx.session.id,
+        filename=filename,
+      )
+      if image_part is not None:
+        yield Event(
+          author=self.name,
+          content=types.Content(role="model", parts=[image_part]),
+        )
+      else:
+        yield _text_event(self.name, f"(페이지 {page_no} 삽화를 불러오지 못했습니다.)")
+
+    yield _text_event(self.name, "✅ 동화책이 완성되었습니다!")
+
+
+presenter_agent = StoryBookPresenterAgent(name="StoryBookPresenterAgent")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 루트: 작가 → (병렬)일러스트레이터 → 프레젠터 순서로 실행하는 시퀀스 에이전트.
 #    (adk web 이 root_agent 를 탐색한다.)
 # ──────────────────────────────────────────────────────────────────────────────
 root_agent = SequentialAgent(
   name="StoryBookMakerAgent",
   description=STORY_BOOK_MAKER_DESCRIPTION,
-  sub_agents=[story_writer_agent, illustrator_agent],
+  sub_agents=[story_writer_agent, illustrator_parallel_agent, presenter_agent],
 )
